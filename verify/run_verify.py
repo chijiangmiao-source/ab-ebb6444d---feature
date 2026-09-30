@@ -269,6 +269,48 @@ SKEW_PAYLOAD = {
     ],
 }
 
+# Two write-skew 2-cycles that share T1: T1<->T2 on (x, y), T1<->T3 on
+# (p, q).  The exact minimum feedback vertex set is the single shared
+# vertex -- breaking only the displayed cycle or per-cycle deletion loses.
+RESOLUTION_SHARED_PAYLOAD = {
+    "audit_id": "smoke-resolution-shared",
+    "initial": {"x": 100, "y": 100, "p": 100, "q": 100},
+    "transactions": [
+        {"id": "T1", "start": 1, "commit": 5, "steps": [
+            {"op": "read", "key": "x", "observed": "initial"},
+            {"op": "read", "key": "q", "observed": "initial"},
+            {"op": "write", "key": "y", "value": -100},
+            {"op": "write", "key": "p", "value": -100}]},
+        {"id": "T2", "start": 2, "commit": 6, "steps": [
+            {"op": "read", "key": "y", "observed": "initial"},
+            {"op": "write", "key": "x", "value": 1}]},
+        {"id": "T3", "start": 3, "commit": 7, "steps": [
+            {"op": "read", "key": "p", "observed": "initial"},
+            {"op": "write", "key": "q", "value": 1}]},
+    ],
+}
+
+# Two disjoint symmetric 2-cycles {T1,T2} and {T3,T4}: four minimum sets
+# exist, the ascending-id lexicographic verdict must be {T1, T3}.
+RESOLUTION_TIE_PAYLOAD = {
+    "audit_id": "smoke-resolution-tie",
+    "initial": {f"k{i}": 0 for i in range(1, 5)},
+    "transactions": [
+        {"id": "T1", "start": 1, "commit": 5, "steps": [
+            {"op": "read", "key": "k1", "observed": "initial"},
+            {"op": "write", "key": "k2", "value": 1}]},
+        {"id": "T2", "start": 2, "commit": 6, "steps": [
+            {"op": "read", "key": "k2", "observed": "initial"},
+            {"op": "write", "key": "k1", "value": 1}]},
+        {"id": "T3", "start": 3, "commit": 7, "steps": [
+            {"op": "read", "key": "k3", "observed": "initial"},
+            {"op": "write", "key": "k4", "value": 1}]},
+        {"id": "T4", "start": 4, "commit": 8, "steps": [
+            {"op": "read", "key": "k4", "observed": "initial"},
+            {"op": "write", "key": "k3", "value": 1}]},
+    ],
+}
+
 
 def http(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
@@ -353,6 +395,98 @@ def run_http_smoke() -> bool:
            and {e["type"] for e in cycle["edges"]} == {"rw"}
            and all(e["key"] for e in cycle["edges"]),
            f"POST skew -> {status}, cycle={cycle and cycle['vertices']}")
+
+    # ------------------------------------------------------------
+    # Stable-resolution acceptance (one-shot, exits when finished):
+    #   (a) shared-node double cycle -> one shared revocation
+    #   (b) tied optima -> ascending-id lexicographic verdict
+    #   (c) acyclic source rejected
+    #   (d) original audit still readable (no rewrite)
+    #   (+) idempotent replay / source rebind rejection / fetch
+    # ------------------------------------------------------------
+    def resolve(marker, audit_id):
+        return http("POST", "/api/resolutions",
+                    {"resolution_id": marker, "audit_id": audit_id})
+
+    # (a) shared node
+    status, _, _ = http("POST", "/api/audits", RESOLUTION_SHARED_PAYLOAD)
+    expect("shared-node source frozen", status == 201, f"POST -> {status}")
+    status, headers, plan = resolve("smoke-res-1", "smoke-resolution-shared")
+    expect("shared double cycle revokes only the shared txn",
+           status == 201 and plan["revoked_transactions"] == ["T1"]
+           and plan["serial_order"] == ["T2", "T3"]
+           and plan["residual_edges"] == []
+           and plan["recomputation"]["final_state"] ==
+               {"x": 1, "y": 100, "p": 100, "q": 1},
+           f"POST resolve shared -> {status}, plan={json.dumps(plan, ensure_ascii=False)[:200]}")
+    # every residual edge has surviving endpoints
+    expect("residual edges only between survivors",
+           all(e["from"] not in plan["revoked_transactions"]
+               and e["to"] not in plan["revoked_transactions"]
+               for e in plan["residual_edges"]),
+           "")
+
+    # marker idempotent replay against the same source
+    status, headers, plan2 = resolve("smoke-res-1", "smoke-resolution-shared")
+    expect("resolution marker replays against same source",
+           status == 200 and headers.get("X-Resolution-Replayed") == "true"
+           and plan2 == plan,
+           f"replay -> {status}")
+
+    # (+) plan fetchable by marker
+    status, _, fetched = http("GET", "/api/resolutions/smoke-res-1")
+    expect("resolution plan fetchable by marker",
+           status == 200 and fetched["revoked_transactions"] == ["T1"],
+           f"GET -> {status}")
+
+    # (b) tied optima
+    status, _, _ = http("POST", "/api/audits", RESOLUTION_TIE_PAYLOAD)
+    expect("tie source frozen", status == 201, f"POST -> {status}")
+    status, _, plan = resolve("smoke-res-tie", "smoke-resolution-tie")
+    expect("tied minima adjudicated by ascending-id lex order",
+           status == 201 and plan["revoked_transactions"] == ["T1", "T3"]
+           and plan["serial_order"] == ["T2", "T4"],
+           f"POST resolve tie -> {status}, revoked={plan.get('revoked_transactions')}")
+
+    # marker retransmitted against a different source must be rejected ...
+    other_cyclic = json.loads(json.dumps(SKEW_PAYLOAD))
+    other_cyclic["audit_id"] = "smoke-skew-rebind"
+    http("POST", "/api/audits", other_cyclic)
+    status, _, err = resolve("smoke-res-tie", "smoke-skew-rebind")
+    expect("marker rebind to another source rejected",
+           status == 409 and err["error"] == "RESOLUTION_SOURCE_CONFLICT"
+           and err["bound_audit_id"] == "smoke-resolution-tie",
+           f"rebind -> {status} {err.get('error') if err else err}")
+    # ... and the original plan survives
+    status, _, kept = http("GET", "/api/resolutions/smoke-res-tie")
+    expect("original plan survives rejected rebind",
+           status == 200 and kept["audit_id"] == "smoke-resolution-tie"
+           and kept["revoked_transactions"] == ["T1", "T3"],
+           f"GET kept -> {status}")
+
+    # (c) acyclic source rejected
+    status, _, err = resolve("smoke-res-bad", "smoke-serial")
+    expect("acyclic source resolution rejected",
+           status == 409 and err["error"] == "SOURCE_NOT_CYCLIC",
+           f"resolve acyclic -> {status} {err.get('error') if err else err}")
+    # missing source rejected
+    status, _, err = resolve("smoke-res-missing", "no-such-audit")
+    expect("missing source resolution rejected",
+           status == 404 and err["error"] == "AUDIT_NOT_FOUND",
+           f"resolve missing -> {status}")
+
+    # (d) original audits remain readable and unchanged
+    status, _, verdict = http("GET", "/api/audits/smoke-resolution-shared")
+    expect("cyclic source audit still readable after resolution",
+           status == 200 and verdict["status"] == "NOT_SERIALIZABLE"
+           and len(verdict["edges"]) == 4
+           and verdict["cycle"]["vertices"] == ["T1", "T2"],
+           f"GET source -> {status} {verdict.get('status') if verdict else verdict}")
+    status, _, verdict = http("GET", "/api/audits/smoke-serial")
+    expect("serial source audit regression: still SERIALIZABLE",
+           status == 200 and verdict["status"] == "SERIALIZABLE"
+           and verdict["serial_order"] == ["T1", "T2"],
+           f"GET serial -> {status}")
 
     status, _, body = http("GET", "/api/audits/no-such-id")
     expect("unknown audit -> 404", status == 404, f"GET missing -> {status}")

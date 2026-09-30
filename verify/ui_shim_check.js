@@ -77,7 +77,9 @@ class El {
 }
 
 const ids = ["auditId", "initialRows", "txnList", "txnCount", "verdict",
-  "rawJson", "replayBadge", "submitBtn", "fetchBtn", "addInitRow", "addTxn", "editor"];
+  "rawJson", "replayBadge", "submitBtn", "fetchBtn", "addInitRow", "addTxn", "editor",
+  "resolutionSection", "resolutionId", "resolveBtn", "resolutionVerdict",
+  "resolutionRaw", "resolutionRawWrap", "resolutionReplayBadge"];
 const byId = {};
 ids.forEach(id => { byId[id] = new El("div"); byId[id].id = id; });
 
@@ -86,6 +88,7 @@ const presetButtons = ["stale", "skew", "serial"].map(p => {
 });
 
 const captured = [];
+const resolutions = [];
 global.Option = class extends El {
   constructor(text, value) { super("option"); this.textContent = text; this.value = value; }
 };
@@ -95,8 +98,35 @@ global.document = {
   createElement: tag => new El(tag),
 };
 global.fetch = async (url, opts) => {
+  if (url === "/api/resolutions") {
+    const req = JSON.parse(opts.body);
+    resolutions.push(req);
+    const body = {
+      status: "RESOLVED", audit_id: req.audit_id, resolution_id: req.resolution_id,
+      revoked_transactions: ["T1"], revocation_count: 1,
+      criterion: "minimum revoked-transaction count; ties broken by the lexicographically smallest ascending transaction-id set",
+      residual_vertices: ["T2"], serial_order: ["T2"],
+      residual_edges: [],
+      recomputation: { final_state: { x: -100, y: 100 }, reads_in_order: { T2: [] } },
+    };
+    return {
+      ok: true, status: 201,
+      headers: { get: h => h === "X-Resolution-Replayed" ? "false" : null },
+      json: async () => body,
+    };
+  }
   captured.push({ url, body: JSON.parse(opts.body) });
-  const body = { status: "SERIALIZABLE", serial_order: [], read_checks: [], edges: [] };
+  const p = JSON.parse(opts.body);
+  const body = p.audit_id === "case-write-skew"
+    ? {
+        status: "NOT_SERIALIZABLE", audit_id: p.audit_id, read_checks: [],
+        cycle: { length: 2, vertices: ["T1", "T2"], edges: [] },
+        edges: [
+          { from: "T1", to: "T2", type: "rw", key: "x", from_step: 0, to_step: 1, reason: "" },
+          { from: "T2", to: "T1", type: "rw", key: "y", from_step: 0, to_step: 1, reason: "" },
+        ],
+      }
+    : { status: "SERIALIZABLE", serial_order: [], read_checks: [], edges: [] };
   return {
     ok: true,
     status: 201,
@@ -153,6 +183,46 @@ function submitAndCapture(preset) {
   check("skew: T2 reads y then writes x",
     p.transactions[1].steps[0].key === "y" && p.transactions[1].steps[1].key === "x");
 
+  // ---- stable resolution flow on the frozen cyclic source ----
+  const sec = byId.resolutionSection;
+  check("cyclic verdict reveals resolution section", sec.style.display === "block");
+  check("resolution id prefilled from source",
+    byId.resolutionId.value === "resolve-case-write-skew", byId.resolutionId.value);
+  await byId.resolveBtn.onclick();
+  check("resolution submitted to source",
+    resolutions.length === 1 &&
+    resolutions[0].audit_id === "case-write-skew" &&
+    resolutions[0].resolution_id === "resolve-case-write-skew",
+    JSON.stringify(resolutions[0]));
+  check("resolution plan rendered (revoked + serial order)",
+    byId.resolutionVerdict.innerHTML.includes("处置成功") &&
+    byId.resolutionVerdict.innerHTML.includes("T1") &&
+    byId.resolutionVerdict.innerHTML.includes("T2"));
+
+  // changing the resolution marker must clear the old plan
+  byId.resolutionId.value = "resolve-different-marker";
+  byId.resolutionId.dispatch("input");
+  check("marker change clears old plan",
+    byId.resolutionVerdict.innerHTML.includes("处置标识已更换，旧方案已清除"),
+    byId.resolutionVerdict.innerHTML.slice(0, 50));
+  await byId.resolveBtn.onclick();
+  check("resolution resubmitted under new marker",
+    resolutions[1].resolution_id === "resolve-different-marker");
+
+  // switching the source (loading another preset/submitting an acyclic one)
+  // must clear the old plan and hide the section
+  await submitAndCapture("serial");
+  check("source change hides resolution section and clears old plan",
+    sec.style.display === "none" &&
+    byId.resolutionVerdict.innerHTML === "",
+    `display=${sec.style.display}`);
+
+  // back to skew: section reappears, plan starts empty
+  await submitAndCapture("skew");
+  check("cyclic source again reveals section", sec.style.display === "block");
+  check("old plan did not resurface with the source",
+    !byId.resolutionVerdict.innerHTML.includes("处置成功"));
+
   // dirty: after a successful submit renders a verdict (dirty reset),
   // any subsequent input on the editor must clear the old evidence.
   await new Promise(r => setTimeout(r, 0));
@@ -162,6 +232,8 @@ function submitAndCapture(preset) {
   check("verdict rendered before dirtying (precondition)", rendered);
   check("dirty clears old evidence",
     byId.verdict.innerHTML.includes("旧证据已清除"), byId.verdict.innerHTML.slice(0, 60));
+  check("dirty clears resolution plan too",
+    sec.style.display === "none" && byId.resolutionVerdict.innerHTML === "");
 
   process.exit(failures ? 1 : 0);
 })();

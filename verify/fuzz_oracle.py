@@ -17,7 +17,7 @@ from collections import defaultdict
 
 _SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, _SRC)
-from mvscc import build_analysis  # noqa: E402
+from mvscc import build_analysis, build_resolution, minimum_feedback_vertex_set  # noqa: E402
 
 
 def oracle(payload):
@@ -141,6 +141,39 @@ def best_simple_cycle(adj):
     return best
 
 
+def brute_force_fvs(adj):
+    """Independent minimum-FVS oracle: enumerate subsets, minimum size then
+    the lexicographically smallest ascending id tuple, with an independent
+    three-colour cycle test on the induced graph."""
+    nodes = sorted(adj)
+
+    def cyclic_without(removed):
+        colour = {n: 0 for n in nodes}
+
+        def visit(u):
+            colour[u] = 1
+            for v in adj[u]:
+                if v in removed:
+                    continue
+                if colour[v] == 1 or (colour[v] == 0 and visit(v)):
+                    return True
+            colour[u] = 2
+            return False
+
+        return any(colour[n] == 0 and n not in removed and visit(n) for n in nodes)
+
+    best = None
+    for size in range(len(nodes) + 1):
+        for combo in itertools.combinations(nodes, size):
+            if not cyclic_without(set(combo)):
+                cand = tuple(combo)
+                if best is None or cand < best:
+                    best = cand
+        if best is not None:
+            return list(best)
+    raise AssertionError("unreachable")
+
+
 def random_history(rng):
     nkeys = rng.randint(1, 3)
     keys = [f"k{i}" for i in range(nkeys)]
@@ -209,6 +242,30 @@ def write_skew_history(rng, size):
     return {"audit_id": "fuzz", "initial": {k: 0 for k in keys}, "transactions": txns}
 
 
+def shared_node_history():
+    """Two write-skew 2-cycles sharing transaction H: H<->A on (x,y) and
+    H<->B on (p,q).  The exact minimum FVS is the single shared vertex H;
+    deleting only the displayed short cycle, or one vertex per cycle, loses.
+    Start/commit timestamps keep every initial-read legal."""
+    return {
+        "audit_id": "fuzz",
+        "initial": {"x": 100, "y": 100, "p": 100, "q": 100},
+        "transactions": [
+            {"id": "H", "start": 1, "commit": 7, "steps": [
+                {"op": "read", "key": "x", "observed": "initial"},
+                {"op": "read", "key": "q", "observed": "initial"},
+                {"op": "write", "key": "y", "value": 1},
+                {"op": "write", "key": "p", "value": 1}]},
+            {"id": "A", "start": 2, "commit": 8, "steps": [
+                {"op": "read", "key": "y", "observed": "initial"},
+                {"op": "write", "key": "x", "value": 1}]},
+            {"id": "B", "start": 3, "commit": 9, "steps": [
+                {"op": "read", "key": "p", "observed": "initial"},
+                {"op": "write", "key": "q", "value": 1}]},
+        ],
+    }
+
+
 def main():
     rng = random.Random(20260930)
     trials = 400
@@ -219,6 +276,7 @@ def main():
     cases.append(write_skew_history(rng, 3))
     cases.append(write_skew_history(rng, 4))
     cases.append(write_skew_history(rng, 5))
+    cases.append(shared_node_history())
     stats = {"invalid": 0, "serializable": 0, "cyclic": 0}
     for i, payload in enumerate(cases):
         result = build_analysis(payload)
@@ -249,6 +307,26 @@ def main():
             verts = result["cycle"]["vertices"]
             for a, b in zip(verts, verts[1:] + verts[:1]):
                 assert b in adj[a], (i, a, b)
+
+            # exact minimum FVS, cross-checked against the brute oracle
+            fvs = minimum_feedback_vertex_set({n: set(adj[n]) for n in adj})
+            assert fvs == brute_force_fvs({n: set(adj[n]) for n in adj}), (i, payload, fvs)
+            # the full stabilisation plan: residual graph acyclic, residual
+            # edges touch only survivors, stable order respects every edge
+            plan = build_resolution(payload, result)
+            assert plan["revoked_transactions"] == fvs, (i, plan["revoked_transactions"], fvs)
+            removed = set(fvs)
+            survivors = set(txns) - removed
+            for e in plan["residual_edges"]:
+                assert e["from"] in survivors and e["to"] in survivors, (i, e)
+            kept_pairs = {(e["from"], e["to"]) for e in plan["residual_edges"]}
+            for a, b, _, _ in edges:
+                if a not in removed and b not in removed:
+                    assert (a, b) in kept_pairs, (i, (a, b))
+            assert set(plan["serial_order"]) == survivors, (i, plan["serial_order"])
+            pos = {t: n for n, t in enumerate(plan["serial_order"])}
+            for a, b in kept_pairs:
+                assert pos[a] < pos[b], (i, (a, b), plan["serial_order"])
         else:
             assert result["status"] == "SERIALIZABLE", (i, payload, result["status"])
             stats["serializable"] += 1

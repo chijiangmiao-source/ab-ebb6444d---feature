@@ -55,6 +55,7 @@
     margin-bottom:14px; }
   .verdict.serializable { border-color:var(--ok); background:rgba(47,191,113,.08); }
   .verdict.notserializable { border-color:var(--bad); background:rgba(255,93,108,.08); }
+  .verdict.resolved { border-color:var(--accent); background:rgba(91,140,255,.08); }
   .verdict.invalid, .verdict.error { border-color:var(--warn); background:rgba(240,180,41,.08); }
   .verdict h3 { margin:0 0 4px; font-size:15px; }
   .badge { display:inline-block; font-size:11px; padding:1px 8px; border-radius:20px;
@@ -127,6 +128,22 @@
       <summary>本次请求 / 响应原文</summary>
       <pre id="rawJson" class="final-state" style="white-space:pre-wrap; margin-top:8px"></pre>
     </details>
+
+    <!-- ===================== 稳定处置（仅闭环来源） ===================== -->
+    <div id="resolutionSection" style="display:none; margin-top:16px; border-top:1px solid var(--line); padding-top:14px">
+      <h2>稳定处置 · 最小撤销集合 <span id="resolutionReplayBadge" class="badge" style="display:none">原方案回放</span></h2>
+      <p class="muted" style="margin-top:0">对已冻结且 MVSG 存在闭环的来源，提交一个稳定处置标识，服务在<b>冻结副本</b>上精确计算最小反馈顶点集：先最少化撤销事务数，再按事务标识升序的集合字典序裁决；来源审计本身不会被改写。</p>
+      <label>稳定处置标识 resolution_id（幂等重传；一经提交即绑定当前来源，改换来源将被拒绝）</label>
+      <div class="row">
+        <input type="text" id="resolutionId" placeholder="例如：resolve-orbit-2026-09-30-batch-07">
+        <button type="button" class="primary" id="resolveBtn" style="flex:0 0 auto">提交稳定处置标识</button>
+      </div>
+      <div id="resolutionVerdict" style="margin-top:12px"></div>
+      <details id="resolutionRawWrap" style="display:none">
+        <summary>处置请求 / 响应原文</summary>
+        <pre id="resolutionRaw" class="final-state" style="white-space:pre-wrap; margin-top:8px"></pre>
+      </details>
+    </div>
   </section>
 </main>
 
@@ -141,6 +158,12 @@ const txnList = document.getElementById("txnList");
 const verdictEl = document.getElementById("verdict");
 const rawJsonEl = document.getElementById("rawJson");
 const replayBadge = document.getElementById("replayBadge");
+const resolutionSection = document.getElementById("resolutionSection");
+const resolutionIdEl = document.getElementById("resolutionId");
+const resolutionVerdictEl = document.getElementById("resolutionVerdict");
+const resolutionRawEl = document.getElementById("resolutionRaw");
+const resolutionRawWrap = document.getElementById("resolutionRawWrap");
+const resolutionReplayBadge = document.getElementById("resolutionReplayBadge");
 
 function parseScalar(text) {
   const t = text.trim();
@@ -342,17 +365,39 @@ function serializePayload() {
 }
 
 /* ------------------------------------------------------------------ */
-/* 旧证据清除：草稿上的任何 input/change 都会清空结论                    */
+/* 旧证据清除：草稿上的任何 input/change 都会清空结论；                  */
+/* 来源（草稿 / audit_id / 取回的审计）或处置标识变化都会清空旧方案       */
 /* ------------------------------------------------------------------ */
 let dirty = false;
+let currentSourceId = null;
+
+function clearResolution(message) {
+  currentSourceId = null;
+  resolutionReplayBadge.style.display = "none";
+  resolutionVerdictEl.innerHTML = message
+    ? `<p class="muted">${esc(message)}</p>`
+    : "";
+  resolutionRawEl.textContent = "";
+  resolutionRawWrap.style.display = "none";
+}
 function markDirty() {
   dirty = true;
   replayBadge.style.display = "none";
   verdictEl.innerHTML = '<p class="muted">草稿已修改，旧证据已清除。重新提交以获得新的冻结结论。</p>';
   rawJsonEl.textContent = "";
+  // 草稿即来源：来源一变，旧处置方案必须立即清除
+  resolutionSection.style.display = "none";
+  clearResolution();
 }
 document.getElementById("editor").addEventListener("input", () => { if (!dirty) markDirty(); });
 document.getElementById("auditId").addEventListener("input", markDirty);
+resolutionIdEl.addEventListener("input", () => {
+  // 仅更换处置标识：清除旧方案，但保留当前来源上下文
+  resolutionReplayBadge.style.display = "none";
+  resolutionVerdictEl.innerHTML = '<p class="muted">处置标识已更换，旧方案已清除。重新提交以获得新方案。</p>';
+  resolutionRawEl.textContent = "";
+  resolutionRawWrap.style.display = "none";
+});
 
 /* ------------------------------------------------------------------ */
 /* 结论渲染                                                            */
@@ -387,6 +432,9 @@ function esc(s) {
 
 function renderVerdict(v) {
   dirty = false;
+  // A freshly rendered verdict is the frozen source context: any plan that
+  // belonged to the previously shown source is stale and must be cleared.
+  clearResolution();
   let html = "";
   if (v.status === "SERIALIZABLE") {
     const chain = v.serial_order.map((id, i) =>
@@ -428,9 +476,60 @@ function renderVerdict(v) {
     html = `<div class="verdict error"><h3>服务端返回未知状态</h3><pre class="final-state">${esc(JSON.stringify(v, null, 2))}</pre></div>`;
   }
   verdictEl.innerHTML = html;
+
+  // 稳定处置仅对已冻结的闭环来源开放
+  if (v.status === "NOT_SERIALIZABLE" && v.audit_id) {
+    currentSourceId = v.audit_id;
+    if (!resolutionIdEl.value) resolutionIdEl.value = "resolve-" + v.audit_id;
+    resolutionSection.style.display = "block";
+  } else {
+    currentSourceId = null;
+    resolutionSection.style.display = "none";
+  }
+}
+function renderResolution(plan, replayed) {
+  resolutionReplayBadge.style.display = replayed ? "inline-block" : "none";
+  const revoked = plan.revoked_transactions || [];
+  const order = plan.serial_order || [];
+  const chain = order.map((id, i) =>
+    `<span class="chip">${esc(id)}</span>${i < order.length - 1 ? '<span class="arrow">→</span>' : ""}`).join("");
+  const recomp = plan.recomputation || {};
+  const reads = Object.entries(recomp.reads_in_order || {}).map(([tid, rs]) =>
+    `<tr><td><code>${esc(tid)}</code></td><td>${
+      rs.length ? rs.map(r => `#${r.step} 读 <code>${esc(r.key)}</code> = <code>${esc(JSON.stringify(r.value))}</code>`).join("<br>")
+                : '<span class="muted">无读步骤</span>'}</td></tr>`).join("");
+  const revChips = revoked.length
+    ? revoked.map(id => `<span class="chip" style="border-color:var(--bad);color:var(--bad)">${esc(id)}</span>`).join("")
+    : '<span class="muted">无（图本身已无环）</span>';
+  resolutionVerdictEl.innerHTML = `<div class="verdict resolved">
+    <h3>🛠 处置成功 · 最少撤销 ${plan.revocation_count} 个事务，残留历史可串行化</h3>
+    <p>裁决准则：${esc(plan.criterion)}</p>
+    <h4>撤销事务（${revoked.length}）</h4>
+    <p>${revChips}</p>
+    <h4>撤销后的一条串行顺序（既有稳定规则：Kahn + 最小标识）</h4>
+    <p>${chain || '<span class="muted">无残留事务</span>'}</p>
+    <h4>按该顺序复算最终键值</h4>
+    <div class="final-state">${esc(JSON.stringify(recomp.final_state, null, 2))}</div>
+    <table><thead><tr><th>串行顺序中的事务</th><th>每步读到的值</th></tr></thead><tbody>${reads}</tbody></table>
+    <details><summary>筛除撤销事务后的全部残留边（${(plan.residual_edges || []).length}）</summary>${edgesTable(plan.residual_edges)}</details>
+  </div>`;
+}
+function renderResolutionError(status, body) {
+  resolutionReplayBadge.style.display = "none";
+  const bound = body && body.error === "RESOLUTION_SOURCE_CONFLICT";
+  const cyclic = body && body.error === "SOURCE_NOT_CYCLIC";
+  resolutionVerdictEl.innerHTML = `<div class="verdict ${bound || cyclic ? "notserializable" : "error"}">
+    <h3>${bound ? "⛔ 处置标识已绑定其他来源"
+        : cyclic ? "⛔ 来源不存在闭环，处置被拒绝"
+        : `处置请求失败（HTTP ${status}）`}</h3>
+    <p>${esc(body && body.message || JSON.stringify(body))}</p>
+    ${body && body.bound_audit_id ? `<p class="muted">已绑定来源：<code>${esc(body.bound_audit_id)}</code>；本次请求来源：<code>${esc(body.requested_audit_id)}</code>——原方案未被覆盖。</p>` : ""}
+  </div>`;
 }
 function renderError(status, body) {
   dirty = false;
+  resolutionSection.style.display = "none";
+  clearResolution();
   const frozen = body && body.error === "AUDIT_ID_CONFLICT";
   verdictEl.innerHTML = `<div class="verdict ${frozen ? "notserializable" : "error"}">
     <h3>${frozen ? "⛔ 审计标识已被不同载荷冻结" : `请求失败（HTTP ${status}）`}</h3>
@@ -480,8 +579,36 @@ async function fetchAudit() {
   if (resp.ok) { replayBadge.style.display = "inline-block"; renderVerdict(body); }
   else { replayBadge.style.display = "none"; renderError(resp.status, body); }
 }
+async function submitResolution() {
+  const sourceId = currentSourceId;
+  const resolutionId = resolutionIdEl.value.trim();
+  if (!sourceId) { renderResolutionError(400, { message: "请先提交或取回一个存在闭环的冻结来源" }); return; }
+  if (!resolutionId) { renderResolutionError(400, { message: "请先填写稳定处置标识" }); return; }
+  const reqBody = { resolution_id: resolutionId, audit_id: sourceId };
+  resolutionRawWrap.style.display = "block";
+  resolutionRawEl.textContent = "REQUEST POST /api/resolutions\n" + JSON.stringify(reqBody, null, 2);
+  let resp;
+  try {
+    resp = await fetch("/api/resolutions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(reqBody),
+    });
+  } catch (e) {
+    renderResolutionError(0, { message: "无法连接服务：" + e });
+    return;
+  }
+  const body = await resp.json();
+  resolutionRawEl.textContent += `\n\nRESPONSE ${resp.status} (X-Resolution-Replayed: ${resp.headers.get("X-Resolution-Replayed")})\n` + JSON.stringify(body, null, 2);
+  if (resp.ok) {
+    renderResolution(body, resp.headers.get("X-Resolution-Replayed") === "true");
+  } else {
+    renderResolutionError(resp.status, body);
+  }
+}
 document.getElementById("submitBtn").onclick = submitAudit;
 document.getElementById("fetchBtn").onclick = fetchAudit;
+document.getElementById("resolveBtn").onclick = submitResolution;
 document.getElementById("addInitRow").onclick = () => addInitRow();
 document.getElementById("addTxn").onclick = () => addTxn();
 

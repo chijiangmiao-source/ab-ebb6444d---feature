@@ -187,5 +187,152 @@ class HttpApiTests(HttpServerTestBase):
         self.assertEqual(body["error"], "AUDIT_NOT_FOUND")
 
 
+SHARED_NODE_PAYLOAD = {
+    "audit_id": "shared-node",
+    "initial": {"x": 100, "y": 100, "p": 100, "q": 100},
+    "transactions": [
+        {"id": "T1", "start": 1, "commit": 5, "steps": [
+            {"op": "read", "key": "x", "observed": "initial"},
+            {"op": "read", "key": "q", "observed": "initial"},
+            {"op": "write", "key": "y", "value": -100},
+            {"op": "write", "key": "p", "value": -100}]},
+        {"id": "T2", "start": 2, "commit": 6, "steps": [
+            {"op": "read", "key": "y", "observed": "initial"},
+            {"op": "write", "key": "x", "value": 1}]},
+        {"id": "T3", "start": 3, "commit": 7, "steps": [
+            {"op": "read", "key": "p", "observed": "initial"},
+            {"op": "write", "key": "q", "value": 1}]},
+    ],
+}
+
+TIE_PAYLOAD = {
+    "audit_id": "tie",
+    "initial": {k: 0 for k in ("k1", "k2", "k3", "k4")},
+    "transactions": [
+        {"id": "T1", "start": 1, "commit": 5, "steps": [
+            {"op": "read", "key": "k1", "observed": "initial"},
+            {"op": "write", "key": "k2", "value": 1}]},
+        {"id": "T2", "start": 2, "commit": 6, "steps": [
+            {"op": "read", "key": "k2", "observed": "initial"},
+            {"op": "write", "key": "k1", "value": 1}]},
+        {"id": "T3", "start": 3, "commit": 7, "steps": [
+            {"op": "read", "key": "k3", "observed": "initial"},
+            {"op": "write", "key": "k4", "value": 1}]},
+        {"id": "T4", "start": 4, "commit": 8, "steps": [
+            {"op": "read", "key": "k4", "observed": "initial"},
+            {"op": "write", "key": "k3", "value": 1}]},
+    ],
+}
+
+
+class ResolutionHttpTests(HttpServerTestBase):
+    def test_resolution_on_shared_node_double_cycle_revokes_one(self):
+        status, _, _ = self.request("POST", "/api/audits", SHARED_NODE_PAYLOAD)
+        self.assertEqual(status, 201)
+        status, headers, plan = self.request(
+            "POST", "/api/resolutions",
+            {"resolution_id": "res-1", "audit_id": "shared-node"})
+        self.assertEqual(status, 201)
+        self.assertEqual(headers.get("X-Resolution-Replayed"), "false")
+        self.assertEqual(plan["status"], "RESOLVED")
+        self.assertEqual(plan["revoked_transactions"], ["T1"])
+        self.assertEqual(plan["serial_order"], ["T2", "T3"])
+        self.assertEqual(plan["residual_edges"], [])
+        self.assertEqual(
+            plan["recomputation"]["final_state"],
+            {"x": 1, "y": 100, "p": 100, "q": 1},
+        )
+
+    def test_resolution_tie_break_is_ascending_id_lexicographic(self):
+        self.request("POST", "/api/audits", TIE_PAYLOAD)
+        status, _, plan = self.request(
+            "POST", "/api/resolutions",
+            {"resolution_id": "res-tie", "audit_id": "tie"})
+        self.assertEqual(status, 201)
+        self.assertEqual(plan["revoked_transactions"], ["T1", "T3"])
+        self.assertEqual(plan["serial_order"], ["T2", "T4"])
+
+    def test_resolution_marker_is_idempotent(self):
+        self.request("POST", "/api/audits", SHARED_NODE_PAYLOAD)
+        body = {"resolution_id": "res-idem", "audit_id": "shared-node"}
+        s1, h1, p1 = self.request("POST", "/api/resolutions", body)
+        s2, h2, p2 = self.request("POST", "/api/resolutions", body)
+        self.assertEqual((s1, h1.get("X-Resolution-Replayed")), (201, "false"))
+        self.assertEqual((s2, h2.get("X-Resolution-Replayed")), (200, "true"))
+        self.assertEqual(p1, p2)
+        # fetchable by marker
+        s3, _, p3 = self.request("GET", "/api/resolutions/res-idem")
+        self.assertEqual(s3, 200)
+        self.assertEqual(p3, p1)
+        # listed
+        s4, _, listing = self.request("GET", "/api/resolutions")
+        self.assertEqual(s4, 200)
+        self.assertIn("res-idem", listing["resolution_ids"])
+
+    def test_marker_retransmitted_against_other_source_rejected(self):
+        self.request("POST", "/api/audits", SHARED_NODE_PAYLOAD)
+        self.request("POST", "/api/audits", base_payload(audit_id="other-cyclic", skew=True))
+        self.request("POST", "/api/resolutions",
+                     {"resolution_id": "res-bound", "audit_id": "shared-node"})
+        status, _, err = self.request(
+            "POST", "/api/resolutions",
+            {"resolution_id": "res-bound", "audit_id": "other-cyclic"},
+            expect_error=True)
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error"], "RESOLUTION_SOURCE_CONFLICT")
+        self.assertEqual(err["bound_audit_id"], "shared-node")
+        self.assertEqual(err["requested_audit_id"], "other-cyclic")
+        # original plan survives
+        _, _, plan = self.request("GET", "/api/resolutions/res-bound")
+        self.assertEqual(plan["audit_id"], "shared-node")
+
+    def test_resolution_of_missing_source_is_404(self):
+        status, _, body = self.request(
+            "POST", "/api/resolutions",
+            {"resolution_id": "r", "audit_id": "ghost"}, expect_error=True)
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "AUDIT_NOT_FOUND")
+
+    def test_resolution_of_acyclic_source_is_409_and_source_unchanged(self):
+        self.request("POST", "/api/audits", base_payload(audit_id="acyclic-src"))
+        status, _, body = self.request(
+            "POST", "/api/resolutions",
+            {"resolution_id": "r", "audit_id": "acyclic-src"}, expect_error=True)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "SOURCE_NOT_CYCLIC")
+        self.assertEqual(body["source_status"], "SERIALIZABLE")
+        # nothing frozen under the marker
+        status, _, _ = self.request("GET", "/api/resolutions/r", expect_error=True)
+        self.assertEqual(status, 404)
+        # original audit verdict remains readable
+        status, _, verdict = self.request("GET", "/api/audits/acyclic-src")
+        self.assertEqual(status, 200)
+        self.assertEqual(verdict["status"], "SERIALIZABLE")
+
+    def test_source_audit_remains_readable_after_resolution(self):
+        self.request("POST", "/api/audits", SHARED_NODE_PAYLOAD)
+        self.request("POST", "/api/resolutions",
+                     {"resolution_id": "res-keep", "audit_id": "shared-node"})
+        status, _, verdict = self.request("GET", "/api/audits/shared-node")
+        self.assertEqual(status, 200)
+        self.assertEqual(verdict["status"], "NOT_SERIALIZABLE")
+        self.assertEqual(len(verdict["edges"]), 4)
+
+    def test_resolution_bad_requests_are_400(self):
+        status, _, body = self.request(
+            "POST", "/api/resolutions", {"audit_id": "x"}, expect_error=True)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "INVALID_PAYLOAD")
+        status, _, body = self.request(
+            "POST", "/api/resolutions", {"resolution_id": "r"}, expect_error=True)
+        self.assertEqual(status, 400)
+
+    def test_unknown_resolution_returns_404(self):
+        status, _, body = self.request(
+            "GET", "/api/resolutions/no-such", expect_error=True)
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"], "RESOLUTION_NOT_FOUND")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
