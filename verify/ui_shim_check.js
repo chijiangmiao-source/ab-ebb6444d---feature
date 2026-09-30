@@ -77,7 +77,9 @@ class El {
 }
 
 const ids = ["auditId", "initialRows", "txnList", "txnCount", "verdict",
-  "rawJson", "replayBadge", "submitBtn", "fetchBtn", "addInitRow", "addTxn", "editor"];
+  "rawJson", "replayBadge", "submitBtn", "fetchBtn", "addInitRow", "addTxn", "editor",
+  "sourceAuditId", "resolutionId", "resolutionVerdict", "resolutionRaw",
+  "resolveBtn", "fetchResolutionBtn"];
 const byId = {};
 ids.forEach(id => { byId[id] = new El("div"); byId[id].id = id; });
 
@@ -95,7 +97,26 @@ global.document = {
   createElement: tag => new El(tag),
 };
 global.fetch = async (url, opts) => {
-  captured.push({ url, body: JSON.parse(opts.body) });
+  captured.push({ url, body: opts.body ? JSON.parse(opts.body) : null });
+  if (url === "/api/resolutions") {
+    const body = {
+      status: "RESOLVED",
+      source_audit_id: opts.body ? JSON.parse(opts.body).source_audit_id : null,
+      resolution_id: "r-demo",
+      revoked_count: 1,
+      revoked_transactions: ["T1"],
+      retained_transactions: ["T2"],
+      residual_edges: [],
+      serial_order: ["T2"],
+      recomputation: { final_state: { x: -100, y: 100 }, reads_in_order: {} },
+    };
+    return {
+      ok: true,
+      status: 201,
+      headers: { get: h => (h === "X-Resolution-Replayed" ? "false" : null) },
+      json: async () => body,
+    };
+  }
   const body = { status: "SERIALIZABLE", serial_order: [], read_checks: [], edges: [] };
   return {
     ok: true,
@@ -162,6 +183,38 @@ function submitAndCapture(preset) {
   check("verdict rendered before dirtying (precondition)", rendered);
   check("dirty clears old evidence",
     byId.verdict.innerHTML.includes("旧证据已清除"), byId.verdict.innerHTML.slice(0, 60));
+
+  // stable disposition: submit serialises source + resolution ids
+  byId.sourceAuditId.value = "case-write-skew";
+  byId.resolutionId.value = "fix-01";
+  captured.length = 0;
+  await byId.resolveBtn.onclick();
+  check("resolution: POST url", captured[0].url === "/api/resolutions");
+  check("resolution: request body",
+    captured[0].body.source_audit_id === "case-write-skew" &&
+    captured[0].body.resolution_id === "fix-01",
+    JSON.stringify(captured[0].body));
+  check("resolution: revoked txns rendered",
+    byId.resolutionVerdict.innerHTML.includes("撤销事务") &&
+    byId.resolutionVerdict.innerHTML.includes(">T1<"));
+  check("resolution: serial order + final state rendered",
+    byId.resolutionVerdict.innerHTML.includes("T2") &&
+    byId.resolutionVerdict.innerHTML.includes("-100"));
+  check("resolution: residual edges section rendered",
+    byId.resolutionVerdict.innerHTML.includes("残留边"));
+
+  // changing the source id must clear the old plan
+  byId.sourceAuditId.dispatch("input");
+  check("resolution: changing source clears old plan",
+    byId.resolutionVerdict.innerHTML.includes("旧方案已清除"),
+    byId.resolutionVerdict.innerHTML.slice(0, 50));
+
+  // re-render, then changing the resolution id must clear the old plan too
+  await byId.resolveBtn.onclick();
+  byId.resolutionId.dispatch("input");
+  check("resolution: changing resolution id clears old plan",
+    byId.resolutionVerdict.innerHTML.includes("旧方案已清除"),
+    byId.resolutionVerdict.innerHTML.slice(0, 50));
 
   process.exit(failures ? 1 : 0);
 })();

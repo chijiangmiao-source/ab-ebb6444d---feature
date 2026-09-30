@@ -258,7 +258,7 @@ def _add_edge(graph, fro, to, edge):
 
 
 def build_analysis(payload: dict) -> dict:
-    """Run validation, version checks and graph construction.
+    """Validate, run version checks and graph construction.
 
     Returns a result dict.  ``status`` is one of:
 
@@ -267,6 +267,16 @@ def build_analysis(payload: dict) -> dict:
     * ``NOT_SERIALIZABLE`` -- graph cyclic, a shortest cycle is given.
     """
     norm = validate_payload(payload)
+    verdict, _adjacency = analyze_normalized(norm)
+    return verdict
+
+
+def analyze_normalized(norm: dict) -> tuple[dict, dict | None]:
+    """Run the analysis on an already-normalised payload.
+
+    Returns ``(verdict, adjacency)``; ``adjacency`` is ``None`` for an
+    ``INVALID_READ`` verdict, since no graph is built in that case.
+    """
     initial = norm["initial"]
     txns = norm["transactions"]
     txn_by_id = {t["id"]: t for t in txns}
@@ -349,7 +359,7 @@ def build_analysis(payload: dict) -> dict:
             "invalid_reads": invalid_reads,
             "read_checks": read_checks,
             "transactions": [t["id"] for t in txns],
-        }
+        }, None
 
     # ------------------------------------------------------------------
     # 2. construct the multi-version serialisation graph
@@ -483,7 +493,7 @@ def build_analysis(payload: dict) -> dict:
             "edges": _edges_payload(adjacency),
             "transactions": [t["id"] for t in txns],
             "recomputation": _recompute_serial(order, txns, initial),
-        }
+        }, adjacency
 
     cycle = _shortest_cycle(adjacency, txn_by_id)
     return {
@@ -493,7 +503,7 @@ def build_analysis(payload: dict) -> dict:
         "read_checks": read_checks,
         "edges": _edges_payload(adjacency),
         "transactions": [t["id"] for t in txns],
-    }
+    }, adjacency
 
 
 def _write_step_index(txns, writer_id, key):
@@ -648,3 +658,267 @@ def _recompute_serial(order, txns, initial):
         per_txn[txid] = reads
         store = local_store
     return {"final_state": store, "reads_in_order": per_txn}
+
+
+# ---------------------------------------------------------------------------
+# Stable disposition: exact minimum feedback vertex set on a frozen MVSG
+# ---------------------------------------------------------------------------
+
+def minimum_feedback_vertex_set(adjacency):
+    """Compute the exact minimum feedback vertex set of a directed graph.
+
+    The chosen vertices are the transactions to revoke: the induced subgraph
+    on the remaining vertices is acyclic.  The decision rule is:
+
+    1. minimum number of revoked transactions;
+    2. among all minimum solutions, the *set-lexicographically smallest*
+       one -- solutions are compared as ascending id sequences, so at the
+       smallest id on which two solutions differ, the solution revoking that
+       id wins.
+
+    Exact and exhaustive (never a degree heuristic): cyclic-SCC split,
+    source/sink peeling, branching over every vertex of a shortest directed
+    cycle.  Graphs have at most :data:`MAX_TRANSACTIONS` vertices.
+    Returns ``[]`` for an acyclic graph.
+    """
+    ordered = sorted(adjacency)
+    n = len(ordered)
+    outm = [0] * n
+    inm = [0] * n
+    pos = {v: i for i, v in enumerate(ordered)}
+    for src, dsts in adjacency.items():
+        m = 0
+        for dst in dsts:
+            m |= 1 << pos[dst]
+        outm[pos[src]] = m
+    for i, m in enumerate(outm):
+        while m:
+            b = m & -m
+            inm[b.bit_length() - 1] |= 1 << i
+            m -= b
+
+    def _better(a, b):
+        """Return the set-lexicographically smaller of two FVS bit masks
+        (cardinality compared first)."""
+        if a.bit_count() != b.bit_count():
+            return a if a.bit_count() < b.bit_count() else b
+        diff = a ^ b
+        if not diff:
+            return a
+        low = diff & -diff  # smallest id where the two solutions differ
+        return a if (a & low) else b
+
+    memo = {}
+
+    def _solve(mask):
+        if mask == 0:
+            return 0
+        cached = memo.get(mask)
+        if cached is not None:
+            return cached
+        result = 0
+        for comp in _cyclic_sccs(mask, outm):
+            result |= _solve_scc(comp)
+        memo[mask] = result
+        return result
+
+    def _solve_scc(mask):
+        # Peel vertices that cannot lie on a directed cycle inside the
+        # induced subgraph (zero in- or out-degree), iteratively.
+        while True:
+            peeled = False
+            k = mask
+            while k:
+                b = k & -k
+                k -= b
+                i = b.bit_length() - 1
+                if (outm[i] & mask) == 0 or (inm[i] & mask) == 0:
+                    mask ^= b
+                    peeled = True
+            if not peeled:
+                break
+        if mask == 0:
+            return 0
+
+        # Every FVS must hit every cycle; branch over every vertex of a
+        # shortest directed cycle (a 2-cycle here, when one exists).
+        cycle_bits = _shortest_cycle_bits(mask, outm)
+        best = None
+        k = cycle_bits
+        while k:
+            b = k & -k
+            k -= b
+            candidate = b | _solve(mask ^ b)
+            best = candidate if best is None else _better(best, candidate)
+        return best
+
+    bits = _solve((1 << n) - 1)
+    return [ordered[i] for i in range(n) if bits & (1 << i)]
+
+
+def _cyclic_sccs(mask, outm):
+    """Masks of the strongly connected components that contain a cycle:
+    SCCs of size >= 2, or a singleton with a self-loop.  Kosaraju,
+    restricted to the vertices in ``mask`` (bit i = sorted-vertex i)."""
+    n = len(outm)
+    inm = [0] * n
+    for i, m in enumerate(outm):
+        k = m & mask
+        while k:
+            b = k & -k
+            inm[b.bit_length() - 1] |= 1 << i
+            k -= b
+
+    # first pass: finishing order on the forward graph
+    visited = 0
+    order = []
+    k = mask
+    while k:
+        start = k & -k
+        k ^= start
+        if visited & start:
+            continue
+        visited |= start
+        stack = [(start, outm[start.bit_length() - 1] & mask)]
+        while stack:
+            vb, neigh = stack[-1]
+            if neigh:
+                nb = neigh & -neigh
+                stack[-1] = (vb, neigh ^ nb)
+                if not (visited & nb):
+                    visited |= nb
+                    stack.append((nb, outm[nb.bit_length() - 1] & mask))
+            else:
+                order.append(vb)
+                stack.pop()
+
+    # second pass on the reverse graph
+    comps = []
+    assigned = 0
+    for start in reversed(order):
+        if assigned & start:
+            continue
+        comp = 0
+        stack = [start]
+        while stack:
+            xb = stack.pop()
+            if comp & xb:
+                continue
+            comp |= xb
+            neigh = inm[xb.bit_length() - 1] & mask & ~comp
+            while neigh:
+                nb = neigh & -neigh
+                neigh ^= nb
+                stack.append(nb)
+        assigned |= comp
+        if comp & (comp - 1):
+            comps.append(comp)  # size >= 2 -> contains a directed cycle
+        elif outm[start.bit_length() - 1] & comp:
+            comps.append(comp)  # singleton self-loop
+    return comps
+
+
+def _shortest_cycle_bits(mask, outm):
+    """Return the bit mask of vertices on a shortest directed cycle inside
+    the strongly connected subgraph induced by ``mask``."""
+    best = None
+    starts = mask
+    while starts:
+        sb = starts & -starts
+        starts ^= sb
+        dist = {sb: 0}
+        frontier = [sb]
+        depth = 0
+        found = None
+        while frontier and found is None:
+            depth += 1
+            nxt = []
+            for vb in frontier:
+                neigh = outm[vb.bit_length() - 1] & mask
+                while neigh:
+                    nb = neigh & -neigh
+                    neigh ^= nb
+                    if nb == sb:
+                        found = depth
+                        break
+                    if nb not in dist:
+                        dist[nb] = depth
+                        nxt.append(nb)
+                if found is not None:
+                    break
+            frontier = nxt
+        if found is not None and (best is None or found < best[0]):
+            # reconstruct one shortest return path via BFS parents
+            parent = {sb: None}
+            frontier = [sb]
+            target = None
+            d = 0
+            while frontier and target is None:
+                d += 1
+                nxt = []
+                for vb in frontier:
+                    neigh = outm[vb.bit_length() - 1] & mask
+                    while neigh:
+                        nb = neigh & -neigh
+                        neigh ^= nb
+                        if nb == sb and d == found:
+                            target = vb
+                            break
+                        if nb not in parent and d < found:
+                            parent[nb] = vb
+                            nxt.append(nb)
+                    if target is not None:
+                        break
+                frontier = nxt
+            path = 0
+            node = target
+            while node is not None:
+                path |= node
+                node = parent[node]
+            best = (found, path)
+    return best[1]
+
+
+def build_resolution(norm, adjacency, audit_id, resolution_id):
+    """Build the stable-disposition plan for a frozen cyclic audit.
+
+    ``adjacency`` is the frozen MVSG with the per-pair edge evidence.  The
+    exact minimum feedback vertex set decides the minimum set of transactions
+    to revoke; the response carries every edge surviving among the retained
+    transactions, the stable serial order (Kahn + id-heap) of the retained
+    history and its replayed final key/value state.  The source audit itself
+    is never rewritten.
+    """
+    initial = norm["initial"]
+    txns = norm["transactions"]
+
+    revoked = minimum_feedback_vertex_set(adjacency)
+    revoked_set = set(revoked)
+
+    residual = {
+        src: {dst: edges for dst, edges in dsts.items() if dst not in revoked_set}
+        for src, dsts in adjacency.items()
+        if src not in revoked_set
+    }
+    order = _stable_topological_order(residual)
+    if order is None:  # pragma: no cover - defensive invariant
+        raise RuntimeError("internal: residual graph after exact FVS still cyclic")
+
+    retained_txns = [t for t in txns if t["id"] not in revoked_set]
+    recomputation = _recompute_serial(order, retained_txns, initial)
+
+    return {
+        "resolution_id": resolution_id,
+        "source_audit_id": audit_id,
+        "status": "RESOLVED",
+        "revoked_transactions": revoked,
+        "revoked_count": len(revoked),
+        "retained_transactions": [t["id"] for t in txns if t["id"] not in revoked_set],
+        "residual_edges": _edges_payload(residual),
+        "serial_order": order,
+        "recomputation": recomputation,
+        "tie_break": (
+            "minimum revocation count, then set-lexicographic order over "
+            "ascending transaction ids"
+        ),
+    }

@@ -269,6 +269,47 @@ SKEW_PAYLOAD = {
     ],
 }
 
+# Two 2-cycles sharing T2 (T1<->T2 over x/y, T2<->T3 over p/q): the exact
+# minimum feedback vertex set is the single shared vertex T2.
+DOUBLE_CYCLE_PAYLOAD = {
+    "audit_id": "smoke-double-cycle",
+    "initial": {"x": 0, "y": 0, "p": 0, "q": 0},
+    "transactions": [
+        {"id": "T1", "start": 1, "commit": 5, "steps": [
+            {"op": "read", "key": "x", "observed": "initial"},
+            {"op": "write", "key": "y", "value": 1}]},
+        {"id": "T2", "start": 1, "commit": 6, "steps": [
+            {"op": "read", "key": "y", "observed": "initial"},
+            {"op": "read", "key": "p", "observed": "initial"},
+            {"op": "write", "key": "x", "value": 2},
+            {"op": "write", "key": "q", "value": 2}]},
+        {"id": "T3", "start": 1, "commit": 7, "steps": [
+            {"op": "read", "key": "q", "observed": "initial"},
+            {"op": "write", "key": "p", "value": 3}]},
+    ],
+}
+
+# Two disjoint 2-cycles (T1,T2) and (T3,T4): minimum size is 2 and the
+# set-lexicographic tie-break must pick the smaller id in each cycle.
+TIE_PAYLOAD = {
+    "audit_id": "smoke-fvs-tie",
+    "initial": {"k1": 0, "k2": 0, "k3": 0, "k4": 0},
+    "transactions": [
+        {"id": "T1", "start": 1, "commit": 5, "steps": [
+            {"op": "read", "key": "k1", "observed": "initial"},
+            {"op": "write", "key": "k2", "value": 1}]},
+        {"id": "T2", "start": 1, "commit": 6, "steps": [
+            {"op": "read", "key": "k2", "observed": "initial"},
+            {"op": "write", "key": "k1", "value": 2}]},
+        {"id": "T3", "start": 1, "commit": 7, "steps": [
+            {"op": "read", "key": "k3", "observed": "initial"},
+            {"op": "write", "key": "k4", "value": 3}]},
+        {"id": "T4", "start": 1, "commit": 8, "steps": [
+            {"op": "read", "key": "k4", "observed": "initial"},
+            {"op": "write", "key": "k3", "value": 4}]},
+    ],
+}
+
 
 def http(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
@@ -353,6 +394,86 @@ def run_http_smoke() -> bool:
            and {e["type"] for e in cycle["edges"]} == {"rw"}
            and all(e["key"] for e in cycle["edges"]),
            f"POST skew -> {status}, cycle={cycle and cycle['vertices']}")
+
+    # ------------------------------------------------------------------
+    # stable disposition: exact minimum feedback vertex set
+    # ------------------------------------------------------------------
+    status, _, body = http("POST", "/api/audits", DOUBLE_CYCLE_PAYLOAD)
+    expect("double-cycle source frozen as cyclic",
+           status == 201 and body["status"] == "NOT_SERIALIZABLE",
+           f"POST double -> {status} {body.get('status') if body else body}")
+    status, headers, body = http(
+        "POST", "/api/resolutions",
+        {"source_audit_id": "smoke-double-cycle", "resolution_id": "smoke-fix-double"})
+    expect("shared-node double cycle: one shared revocation suffices",
+           status == 201 and body["revoked_transactions"] == ["T2"]
+           and body["serial_order"] == ["T1", "T3"]
+           and body["residual_edges"] == []
+           and body["recomputation"]["final_state"] ==
+           {"x": 0, "y": 1, "p": 3, "q": 0},
+           f"resolve double -> {status}, revoked={body.get('revoked_transactions') if body else body}")
+
+    status, headers2, body2 = http(
+        "POST", "/api/resolutions",
+        {"source_audit_id": "smoke-double-cycle", "resolution_id": "smoke-fix-double"})
+    expect("resolution identical retransmission replays",
+           status == 200 and headers2.get("X-Resolution-Replayed") == "true"
+           and body2 == body,
+           f"resolve replay -> {status}")
+
+    status, _, body = http("POST", "/api/audits", TIE_PAYLOAD)
+    expect("tie source frozen as cyclic",
+           status == 201 and body["status"] == "NOT_SERIALIZABLE",
+           f"POST tie -> {status}")
+    status, _, body = http(
+        "POST", "/api/resolutions",
+        {"source_audit_id": "smoke-fvs-tie", "resolution_id": "smoke-fix-tie"})
+    expect("parallel optima adjudicated by ascending id set-lex order",
+           status == 201 and body["revoked_count"] == 2
+           and body["revoked_transactions"] == ["T1", "T3"]
+           and body["serial_order"] == ["T2", "T4"],
+           f"resolve tie -> {status}, revoked={body.get('revoked_transactions') if body else body}")
+
+    status, _, body = http(
+        "POST", "/api/resolutions",
+        {"source_audit_id": "smoke-serial", "resolution_id": "smoke-fix-serial"})
+    expect("acyclic source disposition rejected",
+           status == 409 and body["error"] == "SOURCE_NOT_CYCLIC"
+           and body["source_status"] == "SERIALIZABLE",
+           f"resolve acyclic -> {status} {body.get('error') if body else body}")
+
+    status, _, body = http(
+        "POST", "/api/resolutions",
+        {"source_audit_id": "no-such-audit", "resolution_id": "smoke-fix-missing"})
+    expect("missing source disposition rejected",
+           status == 404 and body["error"] == "SOURCE_AUDIT_NOT_FOUND",
+           f"resolve missing -> {status}")
+
+    status, _, body = http(
+        "POST", "/api/resolutions",
+        {"source_audit_id": "smoke-fvs-tie", "resolution_id": "smoke-fix-double"})
+    expect("resolution id rebound to another source rejected",
+           status == 409 and body["error"] == "RESOLUTION_ID_CONFLICT"
+           and body["existing_source_audit_id"] == "smoke-double-cycle"
+           and body["requested_source_audit_id"] == "smoke-fvs-tie",
+           f"rebind -> {status}")
+    status, _, body = http("GET", "/api/resolutions/smoke-fix-double")
+    expect("rebound resolution id still serves the original plan",
+           status == 200 and body["source_audit_id"] == "smoke-double-cycle"
+           and body["revoked_transactions"] == ["T2"],
+           f"GET resolution -> {status}")
+
+    status, _, original = http("GET", "/api/audits/smoke-skew")
+    expect("original cyclic audit still readable after dispositions",
+           status == 200 and original["status"] == "NOT_SERIALIZABLE"
+           and original["cycle"]["vertices"] == ["T1", "T2"]
+           and len(original["edges"]) == 2,
+           f"GET source regression -> {status}")
+    status, _, serial_verdict = http("GET", "/api/audits/smoke-serial")
+    expect("original serial audit still readable after dispositions",
+           status == 200 and serial_verdict["status"] == "SERIALIZABLE"
+           and serial_verdict["serial_order"] == ["T1", "T2"],
+           f"GET serial regression -> {status}")
 
     status, _, body = http("GET", "/api/audits/no-such-id")
     expect("unknown audit -> 404", status == 404, f"GET missing -> {status}")

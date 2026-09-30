@@ -2,11 +2,15 @@
 
 Endpoints
 ---------
-GET  /healthz                 -> trivial health probe (Compose healthcheck)
+GET  /healthz                     -> trivial health probe (Compose healthcheck)
 GET  /                        -> the audit console page (static/index.html)
 POST /api/audits              -> freeze + analyse a payload
 GET  /api/audits/<audit_id>   -> fetch a frozen verdict
 GET  /api/audits              -> list frozen audit ids
+POST /api/resolutions         -> submit a stable disposition for a frozen
+                                 cyclic audit (exact minimum feedback vertex
+                                 set); replays / conflicts by resolution id
+GET  /api/resolutions/<id>    -> fetch a frozen disposition plan
 """
 
 from __future__ import annotations
@@ -19,8 +23,17 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mvscc import PayloadError, build_analysis  # noqa: E402
-from store import ConflictError, FrozenStore  # noqa: E402
+from mvscc import (  # noqa: E402
+    PayloadError,
+    analyze_normalized,
+    build_resolution,
+    validate_payload,
+)
+from store import (  # noqa: E402
+    ConflictError,
+    FrozenStore,
+    ResolutionConflictError,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -70,6 +83,23 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, record["verdict"])
             return
+        if path == "/api/resolutions":
+            self._send_json(404, {"error": "NOT_FOUND", "message": "use POST to submit a resolution"})
+            return
+        if path.startswith("/api/resolutions/"):
+            resolution_id = path[len("/api/resolutions/") :]
+            if "/" in resolution_id or not resolution_id:
+                self._send_json(404, {"error": "NOT_FOUND"})
+                return
+            record = self.server.store.get_resolution(resolution_id)
+            if record is None:
+                self._send_json(
+                    404,
+                    {"error": "RESOLUTION_NOT_FOUND", "resolution_id": resolution_id},
+                )
+                return
+            self._send_json(200, record["plan"])
+            return
         if path in ("/", "/index.html"):
             self._serve_index()
             return
@@ -86,6 +116,9 @@ class AuditHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        if path == "/api/resolutions":
+            self._handle_resolution()
+            return
         if path != "/api/audits":
             self._send_json(404, {"error": "NOT_FOUND"})
             return
@@ -99,7 +132,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            verdict = build_analysis(payload)
+            norm = validate_payload(payload)
+            verdict, adjacency = analyze_normalized(norm)
         except PayloadError as exc:
             self._send_json(400, {"error": "INVALID_PAYLOAD", "message": str(exc)})
             return
@@ -125,8 +159,11 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # The normalised payload and the canonical MVSG (with its edge
+        # evidence) are frozen with the verdict so dispositions never rewrite
+        # or recompute the source audit.
         try:
-            stored, replayed = self.server.store.submit(payload, verdict)
+            stored, replayed = self.server.store.submit(payload, verdict, norm, adjacency)
         except ConflictError as exc:
             self._send_json(
                 409,
@@ -142,6 +179,107 @@ class AuditHandler(BaseHTTPRequestHandler):
             200 if replayed else 201,
             stored,
             [("X-Audit-Replayed", "true" if replayed else "false")],
+        )
+
+    # ------------------------------------------------------------------
+    def _handle_resolution(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(400, {"error": "BAD_JSON", "message": "request body must be valid JSON"})
+            return
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "INVALID_PAYLOAD", "message": "request body must be a JSON object"})
+            return
+        source_audit_id = body.get("source_audit_id")
+        resolution_id = body.get("resolution_id")
+        if not isinstance(source_audit_id, str) or not source_audit_id:
+            self._send_json(400, {"error": "INVALID_PAYLOAD",
+                                  "message": "source_audit_id must be a non-empty string"})
+            return
+        if not isinstance(resolution_id, str) or not resolution_id:
+            self._send_json(400, {"error": "INVALID_PAYLOAD",
+                                  "message": "resolution_id must be a non-empty string"})
+            return
+        if len(resolution_id) > 128:
+            self._send_json(400, {"error": "INVALID_PAYLOAD",
+                                  "message": "resolution_id must be at most 128 characters"})
+            return
+
+        # A resolution id, once bound to a source, is immutable: an identical
+        # retransmission replays the frozen plan without recomputing; reusing
+        # the id for another source is rejected before touching the evidence.
+        existing_resolution = self.server.store.get_resolution(resolution_id)
+        if existing_resolution is not None:
+            if existing_resolution["source"] != source_audit_id:
+                self._send_json(
+                    409,
+                    {"error": "RESOLUTION_ID_CONFLICT",
+                     "message": (
+                         f"resolution_id {resolution_id!r} is already bound to "
+                         f"source audit {existing_resolution['source']!r} and "
+                         f"cannot be rebound to {source_audit_id!r}"
+                     ),
+                     "resolution_id": resolution_id,
+                     "existing_source_audit_id": existing_resolution["source"],
+                     "requested_source_audit_id": source_audit_id},
+                )
+                return
+            self._send_json(
+                200,
+                existing_resolution["plan"],
+                [("X-Resolution-Replayed", "true")],
+            )
+            return
+
+        record = self.server.store.frozen_evidence(source_audit_id)
+        if record is None:
+            self._send_json(
+                404,
+                {"error": "SOURCE_AUDIT_NOT_FOUND",
+                 "message": "the source audit must be frozen before a disposition",
+                 "source_audit_id": source_audit_id},
+            )
+            return
+
+        source_status = record["verdict"]["status"]
+        if source_status != "NOT_SERIALIZABLE":
+            self._send_json(
+                409,
+                {"error": "SOURCE_NOT_CYCLIC",
+                 "message": (
+                     "a stable disposition requires a frozen MVSG with a closed "
+                     f"cycle; source status is {source_status}"
+                 ),
+                 "source_audit_id": source_audit_id,
+                 "source_status": source_status},
+            )
+            return
+
+        plan = build_resolution(
+            record["norm"], record["adjacency"], source_audit_id, resolution_id
+        )
+        try:
+            stored, replayed = self.server.store.submit_resolution(
+                resolution_id, source_audit_id, plan
+            )
+        except ResolutionConflictError as exc:
+            self._send_json(
+                409,
+                {"error": "RESOLUTION_ID_CONFLICT",
+                 "message": str(exc),
+                 "resolution_id": exc.resolution_id,
+                 "existing_source_audit_id": exc.old_source,
+                 "requested_source_audit_id": exc.new_source},
+            )
+            return
+
+        self._send_json(
+            200 if replayed else 201,
+            stored,
+            [("X-Resolution-Replayed", "true" if replayed else "false")],
         )
 
 
